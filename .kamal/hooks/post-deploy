@@ -1,0 +1,15 @@
+#!/usr/bin/env ruby
+
+require_relative './slack'
+require_relative './airbrake'
+
+post_slack_message(
+  '#tech-talk',
+  "#{ENV['KAMAL_PERFORMER']} finished deploying #{ENV['KAMAL_SERVICE']} to #{ENV['KAMAL_HOSTS'].split(',').count} hosts"
+)
+puts "Posted message to slack channel"
+
+airbrake_result = notify_airbrake_of_deployment
+puts "Notified Airbrake of deploy: #{airbrake_result}"
+
+exit 0

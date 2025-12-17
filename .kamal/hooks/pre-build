@@ -1,0 +1,60 @@
+#!/usr/bin/env ruby
+
+# These environment variables are available:
+# KAMAL_RECORDED_AT
+# KAMAL_PERFORMER
+# KAMAL_VERSION
+# KAMAL_HOSTS
+# KAMAL_ROLE (if set)
+# KAMAL_DESTINATION (if set)
+
+require_relative './slack'
+
+def report(message)
+  puts message
+
+  post_slack_message(
+    '#tech-talk',
+    "#{ENV['KAMAL_PERFORMER']} failed pre-check failed for #{ENV['KAMAL_SERVICE']}: #{message}."
+  )
+end
+
+# Check if we have a clean checkout
+unless `git status --porcelain`.chomp.empty?
+  report 'Git checkout is not clean'
+  exit 1
+end
+
+# Check if a remote is configured
+first_remote = `git remote 2>/dev/null`.chomp
+if first_remote.empty?
+  report 'No git remote set'
+  exit 1
+end
+
+# Check if we are deploying the master/main branch
+current_branch = `git branch --show-current`.chomp
+unless %w[main master].include?(current_branch)
+  report "Current branch is #{current_branch}, but only 'master' or 'main' is allowed"
+  exit 1
+end
+
+# Check if the branch has been pushed to the remote
+remote_head = `git ls-remote #{first_remote} --tags #{current_branch} | cut -f1`.chomp
+if remote_head.empty?
+  report 'Branch not pushed to remote'
+  exit 1
+end
+
+# Check if the version we are deploying matches the remote
+unless ENV['KAMAL_VERSION'] == remote_head
+  report "Version (#{ENV['KAMAL_VERSION']}) does not match remote HEAD (#{remote_head})"
+  exit 1
+end
+
+post_slack_message(
+  '#tech-talk',
+  "#{ENV['KAMAL_PERFORMER']} passed all pre-checks for #{ENV['KAMAL_SERVICE']}. Starting deployment to #{ENV['KAMAL_HOSTS'].split(',').count} hosts"
+)
+
+exit 0
