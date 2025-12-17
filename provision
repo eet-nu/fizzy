@@ -1,0 +1,330 @@
+#!/usr/bin/env ruby
+
+# Provision a virtual private server for Kamal deployments on Ubuntu 24 LTS.
+#
+# This script relies on SSH keys authentication.
+#
+# Make sure to add your private key first:
+#   % ssh-add ~/path/to/ssh/key
+#
+# After that, you can either provision all servers:
+#   % ./provision --all
+#
+# Or provision a specific server:
+#   % ./provision -h 127.0.0.1
+
+require 'net/ssh'
+require 'net/http'
+require 'kamal'
+require 'optparse'
+require 'yaml'
+require 'erb'
+
+def parse_arguments
+  options = {}
+
+  OptionParser.new do |opts|
+    opts.banner = "Usage: #{$0} -d [options]"
+
+    opts.on("-h", "--help", "Show this help message") do
+      puts opts
+      exit
+    end
+
+    opts.on('-a', '--all', 'Run on all servers') do |value|
+      options[:all] = true
+    end
+
+    opts.on('-d', '--destination=DESTINATION', 'Run on all servers for matching environment') do |value|
+      options[:destination] = value
+    end
+
+    opts.on('-h', '--host=HOST', 'Run on specifc server') do |value|
+      options[:host] = value
+    end
+  end.parse!
+
+  if options.empty?
+    puts "Error: At least one argument is required"
+    puts "\nUsage: #{$0} --all"
+    puts "\nUsage: #{$0} -d <destination>"
+    puts "Example: #{$0} -d production"
+    puts "\nUsage: #{$0} -h <host>"
+    puts "Example: #{$0} -h 127.0.0.1"
+    exit 1
+  end
+
+  options
+end
+
+def validate_config_file(config_path)
+  unless File.exist?(config_path)
+    puts "Error: Base configuration file not found: #{config_path}"
+    puts "Make sure config/deploy.yml exists"
+    exit 1
+  end
+end
+
+def load_config(base_config_path, destination)
+  config_file = Pathname.new(base_config_path)
+
+  # Let Kamal handle the config loading and merging
+  Kamal::Configuration.create_from(
+    config_file: config_file,
+    destination: destination
+  )
+end
+
+def run_command(ssh, command)
+  description = command[:description]
+  command     = command[:command]
+
+  puts "#{description}…"
+
+  result = ssh.exec!(command)
+
+  if result && result.strip != ""
+    puts "Output: #{result.strip}"
+  end
+end
+
+# BetterStack
+
+def call_api(method=:get, payload = {})
+  uri = URI("https://telemetry.betterstack.com/api/v1/sources")
+  http = Net::HTTP.new(uri.host, uri.port)
+  http.use_ssl = true
+
+  token = `op item get t3v6kr23spsgyl4dxid452feq4 --reveal --fields password`.strip
+
+  request = Net::HTTP::Get.new(uri.request_uri)
+  request = Net::HTTP::Post.new(uri.request_uri) if method == :post
+  request["Authorization"] = "Bearer #{token}"
+  request["Content-Type"] = "application/json"
+
+  request.body = payload.to_json unless payload.empty?
+
+  response = http.request(request)
+end
+
+def sources
+  response = call_api
+  JSON.parse(response.body)['data']
+end
+
+def create_source(hostname)
+  payload = {
+    name: hostname,
+    platform: "docker"
+  }
+  response = call_api(:post, payload)
+
+  if response.code.to_i != 201
+    puts "Failed to create source: #{response.code} - #{response.body}"
+    exit
+  end
+  JSON.parse(response.body)['data']
+end
+
+def get_source_token(hostname)
+  source = sources.detect { |source| source.dig("attributes", "name") == hostname }
+  source = create_source(hostname) unless source
+  source.dig("attributes", "token")
+end
+
+# Server setup commands:
+
+NONINTERACTIVE_ENV = <<~SH
+  export DEBIAN_FRONTEND=noninteractive
+  export DEBCONF_NONINTERACTIVE_SEEN=true
+  export APT_LISTCHANGES_FRONTEND=none
+  export TERM=dumb
+  export DEBCONF_NOWARNINGS=yes
+SH
+
+SETUP_COMMANDS = {
+  allow_longer_connections: {
+    description: 'Allow longer lasting ssh connections',
+    command: <<~SH
+      sed -i 's@#ClientAliveInterval 0@ClientAliveInterval 60@g' /etc/ssh/sshd_config
+      sed -i 's@#ClientAliveCountMax 3@ClientAliveCountMax 10@g' /etc/ssh/sshd_config
+      systemctl restart ssh
+    SH
+  },
+
+  add_swap: {
+    description: 'Add swap space',
+    command: <<~SH
+      if [ ! -f /swapfile ]; then
+        fallocate -l 2GB /swapfile;
+        chmod 600 /swapfile;
+        mkswap /swapfile;
+        swapon /swapfile;
+        echo "\n/swapfile swap swap defaults 0 0\n" >> /etc/fstab;
+        sysctl vm.swappiness=20;
+        echo "\nvm.swappiness=20\n" >> /etc/sysctl.conf
+      else
+        echo "Swap file already exists"
+      fi
+    SH
+  },
+
+  update_system: {
+    description: 'Update packages',
+    command: <<~SH
+      #{NONINTERACTIVE_ENV}
+      apt-get update -qq
+      apt-get upgrade -y -qq
+    SH
+  },
+
+  install_fail2ban: {
+    description: 'Install and run fail2ban',
+    command: <<~SH
+      #{NONINTERACTIVE_ENV}
+      apt-get install -y -qq fail2ban
+      systemctl start fail2ban
+      systemctl enable fail2ban
+    SH
+  },
+
+  install_essentials: {
+    description: 'Install essential packages',
+    command: <<~SH
+      #{NONINTERACTIVE_ENV}
+      apt-get install -y build-essential nmap
+    SH
+  }
+}
+
+SSH_COMMANDS = {
+  secure_ssh: {
+    description: 'Secure SSH',
+    command: <<~SH
+      sed -i -e '/^\(#\|\)PasswordAuthentication/s/^.*$/PasswordAuthentication no/' /etc/ssh/sshd_config
+      sed -i 's/^#HostKeyAlgorithms .*/HostKeyAlgorithms -ssh-dss/' /etc/ssh/sshd_config
+      sed -i 's/^#PubkeyAcceptedKeyTypes .*/PubkeyAcceptedKeyTypes -ssh-dss/' /etc/ssh/sshd_config
+      systemctl restart ssh
+    SH
+  }
+}
+
+def create_group_command(group_name)
+  {
+    description: "Create group #{group_name}",
+    command: <<~SH
+      if ! getent group #{group_name} >/dev/null; then
+        groupadd #{group_name};
+      fi
+    SH
+  }
+end
+
+def add_user_command(user_name)
+  {
+    description: 'Add user with sudo and docker privileges',
+    command: <<~SH
+      if ! id -u #{user_name} >/dev/null 2>&1; then
+        useradd --create-home #{user_name};
+        usermod -s /bin/bash #{user_name};
+        usermod -aG docker #{user_name};
+        su - #{user_name} -c 'mkdir -p ~/.ssh';
+        su - #{user_name} -c 'touch ~/.ssh/authorized_keys';
+        cat /root/.ssh/authorized_keys >> /home/#{user_name}/.ssh/authorized_keys;
+        chmod 700 /home/#{user_name}/.ssh;
+        chmod 600 /home/#{user_name}/.ssh/authorized_keys;
+        echo '#{user_name} ALL=(ALL:ALL) NOPASSWD: ALL' | tee /etc/sudoers.d/#{user_name};
+        chmod 0440 /etc/sudoers.d/#{user_name};
+        visudo -c -f /etc/sudoers.d/#{user_name}
+      else
+        echo "User #{user_name} already exists"
+      fi
+    SH
+  }
+end
+
+NON_ROOT_COMMANDS = {
+  disable_root: {
+    description: 'Disable SSH as root',
+    command: <<~SH
+      sed -i -E 's/^\s*#?\s*PermitRootLogin\s+.*/PermitRootLogin no/' /etc/ssh/sshd_config
+      systemctl restart ssh
+    SH
+  }
+}
+
+begin
+  options = parse_arguments
+
+  base_config_path = File.expand_path("config/deploy.yml")
+  validate_config_file(base_config_path)
+
+  destination = options[:destination] if options[:destination].present?
+  config = load_config(base_config_path, destination)
+
+  hosts = config.roles.map(&:hosts).flatten + config.accessories.map(&:hosts).flatten
+  hosts = hosts.find_all { |host| host == options[:host] } if options[:host].present?
+  hosts.uniq!
+
+  user_name = config.ssh.user
+  hosts.each do |host|
+    puts "Provisioning server '#{host}' with user '#{user_name}'…"
+
+    Net::SSH.start(host, 'root') do |ssh|
+      # Add BetterStack
+      hostname = ssh.exec!("hostname").strip
+      source_token = get_source_token(hostname)
+      run_command ssh, create_group_command("docker")
+
+      SETUP_COMMANDS[:install_vector] = {
+        description: 'Install vector',
+        command: <<~SH
+          curl -sSL https://telemetry.betterstack.com/setup-vector/docker/#{source_token} | bash
+          sudo usermod -aG docker vector
+          sudo systemctl restart vector
+        SH
+      }
+
+      SETUP_COMMANDS.values.each do |command|
+        run_command ssh, command
+      end
+    end
+
+    SSH_COMMANDS.values.each do |command|
+      Net::SSH.start(host, 'root') do |ssh|
+        run_command ssh, command
+      end
+    end
+
+    if user_name == 'root'
+      puts "\nDone!"
+      puts "You should consider disabling login as root."
+    else
+      Net::SSH.start(host, 'root') do |ssh|
+        run_command ssh, add_user_command(user_name)
+
+        NON_ROOT_COMMANDS.values.each do |command|
+          run_command ssh, command
+        end
+      end
+
+      puts "Done!"
+      puts "Remember to log in as '#{user_name}' from now on:"
+      puts "ssh #{user_name}@#{hosts.first}"
+    end
+  end
+
+rescue OptionParser::InvalidOption => e
+    puts "Error: #{e.message}"
+    exit 1
+
+rescue Net::SSH::AuthenticationFailed
+  puts "Error: SSH authentication failed. Make sure your SSH key is added:"
+  puts "  ssh-add ~/path/to/ssh/key"
+  exit 1
+
+rescue StandardError => e
+  puts "Error: #{e.message}"
+  puts e.backtrace
+  exit 1
+end
