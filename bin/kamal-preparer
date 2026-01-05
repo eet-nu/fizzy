@@ -1,0 +1,94 @@
+#!/usr/bin/env ruby
+require 'tmpdir'
+require 'byebug'
+
+### kamal-preparer
+# Fetches files from the eet-nu/kamal-preparer repository and prompts to replace them if they have changed.
+# Usage:
+# bin/kamal-preparer         (Asks for replace confirmation if a file has been changed)
+# bin/kamal-preparer --force (Does not ask for replace confirmation)
+
+WORKING_DIR = Dir.pwd.freeze
+
+if File.directory?(File.join(WORKING_DIR, '.kamal'))
+  puts ".kamal directory exists, proceeding..."
+else
+  puts ".kamal directory does not exist, aborting..."
+  puts "Make sure kamal has been initialized"
+  exit
+end
+
+def confirmed?
+  return true if ARGV.include?('--force')
+
+  puts 'Replace? (y/N)'
+  gets.chomp.downcase == 'y'
+end
+
+Dir.mktmpdir do |tmp_repo|
+  `git clone --depth 1 git@github.com:eet-nu/kamal-preparer.git #{tmp_repo}`
+
+  # First, we check if kamal-preparer itself has been updated
+  git_content   = File.read(File.join(tmp_repo, 'kamal-preparer'))
+  local_content = File.read(File.join(WORKING_DIR, 'bin', 'kamal-preparer'))
+
+  if git_content != local_content
+    # kamal-preparer has been updated, replace myself and abort
+    FileUtils.cp(File.join(tmp_repo, 'kamal-preparer'), File.join(WORKING_DIR, 'bin', 'kamal-preparer'))
+    puts 'kamal-preparer updated itself.'
+    puts 'Run this script again to actually perform it'
+    exit
+  end
+
+  # Copy the provisioning script
+  if File.exist?(File.join(WORKING_DIR, 'provision'))
+    # Provision script exists, check if the content matches
+    git_content   = File.read(File.join(tmp_repo, 'provision'))
+    local_content = File.read(File.join(WORKING_DIR, 'provision'))
+
+    if git_content == local_content
+      puts "Provision script has not changed"
+    else
+      puts "Provision script has changed"
+      if confirmed?
+        FileUtils.cp(File.join(tmp_repo, 'provision'), File.join(WORKING_DIR, 'provision'))
+        puts "Replaced provision script"
+      end
+    end
+  else
+    FileUtils.cp(File.join(tmp_repo, 'provision'), File.join(WORKING_DIR, 'provision'))
+    puts "Copied provision script"
+  end
+
+  # Copy all hooks
+  Dir.each_child(File.join(tmp_repo, 'hooks')) do |filename|
+    puts "Found file: #{filename}"
+
+    # First check if the .sample hook still exists, if so, remove it
+    if File.exist?(File.join(WORKING_DIR, '.kamal', 'hooks', "#{filename}.sample"))
+      puts "Deleting #{filename}.sample"
+      File.delete(File.join(WORKING_DIR, '.kamal', 'hooks', "#{filename}.sample"))
+    end
+
+    # Check if the hook file already exists
+    if File.exist?(File.join(WORKING_DIR, '.kamal', 'hooks', filename))
+      git_content   = File.read(File.join(tmp_repo, 'hooks', filename))
+      local_content = File.read(File.join(WORKING_DIR, '.kamal', 'hooks', filename))
+
+      if git_content == local_content
+        puts "Hook #{filename} has not changed"
+      elsif local_content.include?('preserve!')
+        puts "Hook #{filename} has has changed, but contains preserve flag, not updating"
+      else
+        puts "Hook #{filename} has changed"
+        if confirmed?
+          FileUtils.cp(File.join(tmp_repo, 'hooks', filename), File.join(WORKING_DIR, '.kamal', 'hooks', filename))
+          puts "Replaced #{filename}"
+        end
+      end
+    else
+      FileUtils.cp(File.join(tmp_repo, 'hooks', filename), File.join(WORKING_DIR, '.kamal', 'hooks', filename))
+      puts "Copied hook #{filename}"
+    end
+  end
+end
