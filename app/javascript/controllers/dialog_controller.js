@@ -7,7 +7,8 @@ export default class extends Controller {
   static values = {
     modal: { type: Boolean, default: false },
     sizing: { type: Boolean, default: true },
-    autoOpen: { type: Boolean, default: false }
+    autoOpen: { type: Boolean, default: false },
+    orient: { type: Boolean, default: true }
   }
 
   connect() {
@@ -26,7 +27,9 @@ export default class extends Controller {
       this.dialogTarget.showModal()
     } else {
       this.dialogTarget.show()
-      orient(this.dialogTarget)
+      if (this.orientValue) {
+        orient({ target: this.dialogTarget, anchor: this.element })
+      }
     }
 
     this.loadLazyFrames()
@@ -46,7 +49,7 @@ export default class extends Controller {
     this.dialogTarget.close()
     this.dialogTarget.setAttribute("aria-hidden", "true")
     this.dialogTarget.blur()
-    orient(this.dialogTarget, false)
+    orient({ target: this.dialogTarget, reset: true })
     this.dispatch("close")
   }
 
